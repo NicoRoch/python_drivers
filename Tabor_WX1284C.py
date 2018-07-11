@@ -25,7 +25,8 @@ import struct
 import pyvisa.constants as vc
 import ctypes
 
-################### Constants ##################################################
+################### Constants
+
 MARKER_QUANTUM = 2        #: quantum of marker-length and marker-offset
 _EX_DAT_MARKER_1_MASK = 0x20000000L #: the mask of marker 1 in the extra-data (32-bits) value
 _EX_DAT_MARKER_2_MASK = 0x10000000L #: the mask of marker 2 in the extra-data (32-bits) value
@@ -182,6 +183,7 @@ class Tabor_WX1284C(Instrument):
         self.add_parameter('type_waveform', type=types.StringType,
             flags=Instrument.FLAG_GETSET | Instrument.FLAG_GET_AFTER_SET,
             channels=(1, 4),channel_prefix='ch%d_')
+
         # Add functions #######################################################
         self.add_function('clean_visa_open')
         self.add_function('reset')
@@ -191,6 +193,9 @@ class Tabor_WX1284C(Instrument):
         self.add_function('set_all_amp')
         self.add_function('set_all_offset')
         self.add_function('send_waveform')
+        self.add_function('delete_segments')
+        self.add_function('delete_segment_i')
+        self.add_function('segment_select')
 
         #opening the visa session #############################################
         self.clean_visa_open()
@@ -204,7 +209,7 @@ class Tabor_WX1284C(Instrument):
     # Functions ###############################################################
     def delete_segments(self):
         '''
-        This command will delete all predefined segments and will clear the entire
+        This command will delete ALL predefined segments and will clear the entire
         waveform memory space. This command is particularly important in case
         you want to defragment the entire waveform memory and start building
         your waveform segments from scratch.
@@ -215,11 +220,37 @@ class Tabor_WX1284C(Instrument):
         Output:
             None
         '''
-        logging.info(__name__ + ' : Deleting wveform memory')
+        logging.info(__name__ + ' : Deleting waveform memory')
         for i in [1,2,3,4]:
             self.channel_select(i)
-            self._visainstrument.write('TRAC:DEL:ALL')
+            self._visainstrument.write(':TRAC:DEL:ALL')
 
+    def delete_segment_i(self, i):
+        '''
+        This command will delete the predefined segments i and will clear the
+        waveform memory space. This command is particularly important in case
+        you want to defragment the entire waveform memory and start building
+        your waveform segments from scratch.
+
+        Input:
+            i (int or array of int)
+
+        Output:
+            None
+        '''
+        logging.info(__name__ + ' : Deleting some of the waveform memory')
+        if len(i) == 1:
+            for ch in Channels:
+                self.channel_select(ch)
+                self._visainstrument.write(':TRAC:DEL {}'.format(i))
+        elif len(i) > 1:
+            for ch in Channels:
+                self.channel_select(ch)
+                for j in i:
+                    self._visainstrument.write(':TRAC:DEL {}'.format(j))
+
+        else:
+            print 'problem with len(i) '
 
     def clean_visa_open(self):
         '''
@@ -388,7 +419,8 @@ class Tabor_WX1284C(Instrument):
 
     def send_waveform(self, buffer, ch_id, seg_id):
         '''
-        Sets the active waveform segment seg_id at the output connector ch_id and then download the waveform data buffer to the WX2184C waveform memory.
+        Sets the active waveform segment seg_id at the output connector ch_id
+        and then download the waveform data buffer to the WX2184C waveform memory.
         Inputs:
             buffer: the binary data buffer.
             ch_id (int): channel index. Valid values are 1, 2, 3 and 4.
@@ -398,10 +430,23 @@ class Tabor_WX1284C(Instrument):
         '''
         #self._visainstrument.write('TRAC:MODE SING')
         self.channel_select(ch_id)
-        self._visainstrument.write('TRAC:SEL {}'.format(seg_id))
-        self._visainstrument.write('TRAC:DEF {},{}'.format(seg_id,len(buffer)))
+        self._visainstrument.write(':TRAC:SEL {}'.format(seg_id))
+        self._visainstrument.write(':TRAC:DEF {},{}'.format(seg_id,len(buffer)))
         err_code = self.download_binary_data(":TRAC:DATA",  buffer, len(buffer) * buffer.itemsize)
         return err_code
+
+    def segment_select(self,ch_id,seg_id):
+        '''
+        Sets the active segment seg_id at the output connector ch_id
+        '''
+        self.channel_select(ch_id)
+        self._visainstrument.write(':TRAC:SEL {}'.format(seg_id))
+
+    def inquir(self,command):
+        return self._visainstrument.query(command)
+
+    def Write(self,command):
+        self._visainstrument.write(command)
 
     #Parameters ###############################################################
 
@@ -697,7 +742,7 @@ class Tabor_WX1284C(Instrument):
         logging.info( '{} : Setting the trigger timer time to {}'.format(__name__,period))
         self._visainstrument.write(':TRIG:TIM:TIME '+str(period*1e-6))
 
-        if float(self._visainstrument.query(':TRIG:TIM:TIME?'))*1e6 != period:
+        if round(float(self._visainstrument.query(':TRIG:TIM:TIME?'))*1e6,0) != round(period,0):
             logging.info('Trigger timer time was not set properly')
             raise ValueError('Trigger timer time was not set properly')
 
@@ -1641,7 +1686,7 @@ class Tabor_WX1284C(Instrument):
             mode (string): possible values are 'SINGl' 'DUPL' 'ZER'  'COMB'
         '''
         logging.info( __name__+ ': Getting how the arbitrary waveform is downloaded to the unit memory.')
-        return self._visainstrument.query('TRAC:MODE ?')
+        return self._visainstrument.query(':TRAC:MODE ?')
 
     def do_set_trace_mode(self, mode='SING'):
         '''
@@ -1654,9 +1699,9 @@ class Tabor_WX1284C(Instrument):
         logging.info( __name__+ ': Setting how the arbitrary waveform is downloaded to the unit memory.')
 
         if mode.upper() in ('SING', 'DUPL', 'ZER', 'COMB'):
-            self._visainstrument.write('TRAC:MODE %s' %mode.upper())
+            self._visainstrument.write(':TRAC:MODE %s' %mode.upper())
 
-            if self._visainstrument.query('TRAC:MODE ?') != mode.upper():
+            if self._visainstrument.query(':TRAC:MODE ?') != mode.upper():
                 logging.info('Instrument did not set correctly the mode of the trace arbitrary waveform')
                 raise ValueError('Instrument did not set correctly the mode of the trace arbitrary waveform')
         else:
@@ -2020,7 +2065,6 @@ class Tabor_WX1284C(Instrument):
 
         return self._visainstrument.query('SEQ:ADV?')
 
-
     def seq_jump_source(self,value='BUS'):
         """
         Sequence jump source setter method: in AUTOmatic and STEPped mode only, a jump signal is required to reach the next step of the sequence.
@@ -2085,6 +2129,13 @@ class Tabor_WX1284C(Instrument):
         buff=self.create_wvf_steps_info_buff(buffer)
         # and download the sequence info ..
         self.download_binary_data(":SEQ:DATA", buff, len(buff) * buff.itemsize)
+
+    def sequence_select(self, seq_id):
+        '''
+        Selects the active sequence seq_id
+        '''
+        #select the relevant sequence
+        self._visainstrument.write(":SEQ:SEL {0:d}".format(seq_id))
 
     def query(self, cmd):
         res= self._visainstrument.query(cmd + '?')

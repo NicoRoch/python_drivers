@@ -39,7 +39,7 @@ class ATS9360_NPT(Instrument):
         self.add_parameter('clock_source',
             type        = types.StringType,
             flags       = Instrument.FLAG_GETSET,
-            option_list = ('internal', 'external')
+            option_list = ('internal', 'external', 'fast_external')
             )
 
         self.add_parameter('clock_edge',
@@ -101,6 +101,11 @@ class ATS9360_NPT(Instrument):
             units       = '%'
             )
 
+        self.add_parameter('mode',
+            type        = types.StringType,
+            flags       = Instrument.FLAG_GETSET,
+            option_list = ('CHANNEL_AB','CHANNEL_A','CHANNEL_B','FFT')
+            )
 
         self.allow_samplerates = {1e-3   : ats.SAMPLE_RATE_1KSPS,
                                   2e-3   : ats.SAMPLE_RATE_2KSPS,
@@ -132,7 +137,8 @@ class ATS9360_NPT(Instrument):
 
 
         self.allow_clock_sources = {'internal' : ats.INTERNAL_CLOCK,
-                                    'external' : ats.EXTERNAL_CLOCK_10MHz_REF}
+                                    'external' : ats.EXTERNAL_CLOCK_10MHz_REF,
+                                    'fast_external' : ats.FAST_EXTERNAL_CLOCK}
 
         # By default, we don't take into account the TTL mode for the trigger
         self.allow_trigger_ranges = {5   : ats.ETR_5V,
@@ -144,11 +150,14 @@ class ATS9360_NPT(Instrument):
         self.allow_trigger_slopes = {'positive' : ats.TRIGGER_SLOPE_POSITIVE,
                                     'negative' : ats.TRIGGER_SLOPE_NEGATIVE}
 
-
+        self.allow_modes = {'CHANNEL_AB',
+                            'CHANNEL_A',
+                            'CHANNEL_B',
+                            'FFT'}
 
         # Attributes of the clock
-        self.samplerate   = 1800. # In [MS/s], float
-        self.clock_source = 'external'
+        self.samplerate   = 1000. # In [MS/s], float
+        self.clock_source = 'external' #  fast_external
         self.clock_edge   = 'rising'
 
         # Attributes of the trigger
@@ -158,21 +167,28 @@ class ATS9360_NPT(Instrument):
         self.trigger_delay = 0. # In [ns]
 
         # Attributes of the acquisition
-        self.acquired_samples           = 128*80 # In S. Must be integer
-        self.acquisition_time           = self.acquired_samples/1.8 # In ns, float
-        self.default_records_per_buffer = 100 # Must be integer and even
+        self.samplesPerRecord           = 128*80 # In S. Must be integer
+        self.acquisition_time           = self.samplesPerRecord/(self.samplerate*1e-3) # In ns, float
+        self.default_records_per_buffer = 250 # Must be integer and even
+
         # The current records per buffer is equal to the default one at the
         # initialization of the board.
         self.records_per_buffer         = self.default_records_per_buffer
         self.nb_buffer_allocated        = 4 # Must be integer
         self.buffers_per_acquisition    = 200 # Must be integer
+        self.averaging                  = 100 # Must be integer
         self.nb_sequence                = 2 # Must be integer and even
 
-        # Keep trace of the number of sequence acquired by the board.
+        # Keep trace of the number of buffers acquired by the board.
         # If a measurement is well executed, this number becomes equal to the
-        # number of buffers per acquisition times the number of averaging
+        # number of sequences times the number of averaging
         self._acquired_sequences = 0.
 
+        # Attributes of the display of the acquisition
+        self.T_display = 1
+
+        # Mode of the digitizer.
+        self.mode = 'CHANNEL_AB'
 
         # For the display, we get all parameters at the end of the
         # initialization
@@ -203,6 +219,8 @@ class ATS9360_NPT(Instrument):
 
         self.get_completed_acquisition()
 
+        self.get_mode()
+
 
 
     #########################################################################
@@ -212,30 +230,6 @@ class ATS9360_NPT(Instrument):
     #
     #
     #########################################################################
-
-
-
-    def _get_bytes_per_buffer(self):
-        """
-            Return the number ob bytes per buffer of the board.
-            The calculation is performed assuming that the board works in the
-            NPT mode => no pre-trigger sample.
-        """
-
-        # For sake of clarity, even fixed variable are declared
-        # The name of the variable is meaningfull
-        bitsPerSample      = 12
-        preTriggerSamples  = 0 # We assume NPT mode
-        postTriggerSamples = self.acquired_samples
-        channelCount       = 2 # We assume always two channels active
-        recordsPerBuffer   = self.records_per_buffer
-
-        bytesPerSample   = (bitsPerSample + 7) // 8
-        samplesPerRecord = preTriggerSamples + postTriggerSamples
-        bytesPerRecord   = bytesPerSample * samplesPerRecord
-        bytesPerBuffer   = bytesPerRecord * recordsPerBuffer * channelCount
-
-        return int(bytesPerBuffer)
 
 
 
@@ -261,7 +255,7 @@ class ATS9360_NPT(Instrument):
         parameters['trigger_delay'] = self.trigger_delay
 
         # Acquisition parameters
-        parameters['acquired_samples']        = self.acquired_samples
+        parameters['samplesPerRecord']        = self.samplesPerRecord
         parameters['records_per_buffer']      = self.records_per_buffer
         parameters['nb_buffer_allocated']     = self.nb_buffer_allocated
         parameters['buffers_per_acquisition'] = self.buffers_per_acquisition
@@ -279,6 +273,9 @@ class ATS9360_NPT(Instrument):
         parameters['safe_acquisition'] = False # True means the board has been closed properly
         parameters['safe_treatment']  = [False, False] # True means the treatment is finished
         parameters['measured_buffers'] = None
+
+        # Mode of the digitizer
+        parameters['mode'] = self.mode
 
         return parameters
 
@@ -305,54 +302,101 @@ class ATS9360_NPT(Instrument):
             Output:
                 - None
         """
+        if self.mode == 'CHANNEL_AB':
 
-        # We create shared memory to share data between processes
-        queue_data_cha       = mp.Queue() # Contains measured data cha channel
-        queue_data_chb       = mp.Queue() # Contains measured data chb channel
+            # In case operation mode is 'CHANNEL_AB',
+            # two data treatment processed are required
 
-        self.queue_treatment_cha = mp.Queue() # Contains treated data
-        self.queue_treatment_chb = mp.Queue() # Contains treated data
+            queue_data=[None, None]
+            self.queue_treatment=[None, None]
+            self.worker_treat_data=[None, None]
 
-        # Obtain all the parameters to set the board
-        self.parameters      = self._get_parameters()
+            # We create shared memory to share data between processes
+            queue_data[0]       = mp.Queue() # Contains measured data cha channel
+            queue_data[1]       = mp.Queue() # Contains measured data chb channel
 
-        # We create the data treatment process
-        self.worker_treat_data_cha = mp.Process(target = processor.treat_data,
-                                                args   = (queue_data_cha,
-                                                          self.queue_treatment_cha,
-                                                          self.parameters))
+            self.queue_treatment[0] = mp.Queue() # Contains treated data
+            self.queue_treatment[1] = mp.Queue() # Contains treated data
 
-        self.worker_treat_data_chb = mp.Process(target = processor.treat_data,
-                                                args   = (queue_data_chb,
-                                                          self.queue_treatment_chb,
-                                                          self.parameters))
+            # Obtain all the parameters to set the board
+            self.parameters      = self._get_parameters()
 
-        # We create the data acquisition process
-        self.worker_acquire_data = mp.Process(target = data_acquisition.get_data,
-                                              args   = (queue_data_cha,
-                                                        queue_data_chb,
-                                                        self.parameters))
+            # We create the data treatment process
+            self.worker_treat_data[0] = mp.Process(target = processor.treat_data,
+                                                    args   = (queue_data[0],
+                                                              self.queue_treatment[0],
+                                                              self.parameters))
 
-        # At this point the process is started
-        # Consequently, the measurement is launched.
-        self.worker_acquire_data.start()
-        self.worker_treat_data_cha.start()
-        self.worker_treat_data_chb.start()
+            self.worker_treat_data[1] = mp.Process(target = processor.treat_data,
+                                                    args   = (queue_data[1],
+                                                              self.queue_treatment[1],
+                                                              self.parameters))
 
-        # The share memories are not used anymore in this process
-        queue_data_cha.close()
-        queue_data_chb.close()
+            # We create the data acquisition process
+            self.worker_acquire_data = mp.Process(target = data_acquisition.get_data,
+                                                  args   = (queue_data,
+                                                            self.parameters))
 
-        # Initialize the number of acquired sequence to zero
-        self._acquired_sequences = 0.
+            # At this point the process is started
+            # Consequently, the measurement is launched.
+            self.worker_acquire_data.start()
+            self.worker_treat_data[0].start()
+            self.worker_treat_data[1].start()
+
+            # The share memories are not used anymore in this process
+            queue_data[0].close()
+            queue_data[1].close()
+
+            # Initialize the number of acquired sequence to zero
+            self._acquired_sequences = 0.
+
+        elif self.mode in {'CHANNEL_A', 'CHANNEL_B', 'FFT'}:
+
+            # In case operation mode is 'CHANNEL_A' or 'CHANNEL_B' or 'FFT',
+            # only one data treatment process is required
+
+            # We create shared memory to share data between processes
+            queue_data       = mp.Queue() # Contains measured data cha channel
+
+            self.queue_treatment = mp.Queue() # Contains treated data
 
 
+            # Obtain all the parameters to set the board
+            self.parameters      = self._get_parameters()
+
+            # We create the data treatment process
+            self.worker_treat_data = mp.Process(target = processor.treat_data,
+                                                    args   = (queue_data,
+                                                              self.queue_treatment,
+                                                              self.parameters))
+
+            # We create the data acquisition process
+            self.worker_acquire_data = mp.Process(target = data_acquisition.get_data,
+                                                  args   = (queue_data,
+                                                            self.parameters))
+
+            # At this point the process is started
+            # Consequently, the measurement is launched.
+            self.worker_acquire_data.start()
+            self.worker_treat_data.start()
+
+            # The share memories are not used anymore in this process
+            queue_data.close()
+
+            # Initialize the number of acquired sequence to zero
+            self._acquired_sequences = 0
+        else:
+
+            raise ValueError('mode of the digitizer must be "CHANNEL_AB" or \
+                             "CHANNEL_A" or "CHANNEL_B" or "FFT"')
 
     def measurement(self):
         """
             Return the data treated with the processor given in the
             measurement_initialization method.
-            Data are return everytime a sequence is measured.
+
+            Since plotting is a slow operation, treated data are returned every T_display.
+            The while loop is here to ensure that the treatment queue is emptied as fast as possible.
 
             Input:
                 - None
@@ -360,16 +404,31 @@ class ATS9360_NPT(Instrument):
                 - None
         """
 
-        # Each times the treatment buffer memory is loaded means a  new
-        # averaging has been trated
-        self._acquired_sequences += 1.
+        start_meas = time.clock() # Keep track of when the measurement started
+
+        while time.clock()-start_meas< self.T_display and self.get_completed_acquisition() != 100.:
+            # Each times the treatment buffer memory is loaded means a  new
+            # averaging has been treated
+
+            if self.mode == 'CHANNEL_AB':
+                # In case operation mode is 'CHANNEL_AB',
+                # two data treatment processed are required
+                result = self.queue_treatment[0].get(), self.queue_treatment[1].get()
+            elif self.mode in {'CHANNEL_A', 'CHANNEL_B', 'FFT'}:
+                # In case operation mode is 'CHANNEL_A' or 'CHANNEL_B' or 'FFT',
+                # only one data treatment process is required
+                result = self.queue_treatment.get()
+            else:
+                raise ValueError('mode of the digitizer must be "CHANNEL_AB" or \
+                                 "CHANNEL_A" or "CHANNEL_B" or "FFT"')
+
+            self._acquired_sequences += 1.
 
         # We update the percentage of the measurement
         self.get_completed_acquisition()
 
         # We return the data of the buffer memory
-        return self.queue_treatment_cha.get(), self.queue_treatment_chb.get()
-
+        return result
 
 
     def measurement_close(self, transfert_info=False):
@@ -396,11 +455,24 @@ class ATS9360_NPT(Instrument):
 
         # Once the board is "close" properly, we close the FIFO memory and
         # we close the child processes and the share memory
-        self.queue_treatment_cha.close()
-        self.queue_treatment_chb.close()
-        self.worker_acquire_data.terminate()
-        self.worker_treat_data_cha.terminate()
-        self.worker_treat_data_chb.terminate()
+
+        if self.mode == 'CHANNEL_AB':
+            # In case operation mode is 'CHANNEL_AB',
+            # two data treatment processed are required
+            self.queue_treatment[0].close()
+            self.queue_treatment[1].close()
+            self.worker_acquire_data.terminate()
+            self.worker_treat_data[0].terminate()
+            self.worker_treat_data[1].terminate()
+        elif self.mode in {'CHANNEL_A', 'CHANNEL_B', 'FFT'}:
+            # In case operation mode is 'CHANNEL_A' or 'CHANNEL_B' or 'FFT',
+            # only one data treatment process is required
+            self.queue_treatment.close()
+            self.worker_acquire_data.terminate()
+            self.worker_treat_data.terminate()
+        else:
+            raise ValueError('mode of the digitizer must be "CHANNEL_AB" or \
+                             "CHANNEL_A" or "CHANNEL_B" or "FFT"')
 
 
         self._acquired_sequences = 0.
@@ -431,7 +503,7 @@ class ATS9360_NPT(Instrument):
                  The acquisition time will be round the closest value reachable
                  considering the samplerate.
 
-                 The number of acquired sample must a multiple of 128.
+                 The number of acquired sample must be a multiple of 128.
                  The number of acquired sample will be round the closest value
                  reachable.
 
@@ -445,14 +517,14 @@ class ATS9360_NPT(Instrument):
                 #   in the board.
             '''
 
-        if acquisition_time > 256./self.samplerate*1e3:
+        if acquisition_time >= 256./self.samplerate*1e3:
 
-            acquired_samples      = round(self.samplerate*acquisition_time*1e-3)
-            self.acquired_samples = int(round(acquired_samples/128)*128)
-            self.acquisition_time = self.acquired_samples/self.samplerate*1e3
+            samplesPerRecord      = round(self.samplerate*acquisition_time*1e-3)
+            self.samplesPerRecord = int(round(samplesPerRecord/128)*128)
+            self.acquisition_time = self.samplesPerRecord/self.samplerate*1e3
 
             # To display the new value of acquired sample of get it
-            # self.get_acquired_samples()
+            # self.get_samplesPerRecord()
         else:
 
             raise ValueError('The acquisition time must be longer than '\
@@ -492,17 +564,12 @@ class ATS9360_NPT(Instrument):
 
         if nb_averaging%2:
             raise ValueError('The number of averaging should be even')
-        if nb_averaging*self.nb_sequence > self.default_records_per_buffer:
-            if nb_averaging%self.default_records_per_buffer:
-                raise ValueError('When nb_averaging x nb_sequence >100, nb_averaging must be a multiple of 100')
 
         if nb_averaging*self.nb_sequence < self.default_records_per_buffer:
             self.buffers_per_acquisition = 1
             self.records_per_buffer      = int(nb_averaging*self.nb_sequence)
         else:
-            self.records_per_buffer      = int(self.default_records_per_buffer)
-            self.buffers_per_acquisition = int(np.ceil(float(nb_averaging*self.nb_sequence)\
-                                                       /self.default_records_per_buffer))
+            self.buffers_per_acquisition = int(np.ceil(float(nb_averaging*self.nb_sequence)/self.records_per_buffer))
 
         if output:
             m  = 'buffer per acquisition:', self.buffers_per_acquisition
@@ -512,8 +579,6 @@ class ATS9360_NPT(Instrument):
             m += 'tot:', self.buffers_per_acquisition*self.records_per_buffer
 
             return m
-
-
 
     def do_get_averaging(self):
         '''
@@ -527,7 +592,6 @@ class ATS9360_NPT(Instrument):
         '''
 
         return self.buffers_per_acquisition*self.records_per_buffer/self.nb_sequence
-
 
 
     def do_set_nb_sequence(self, nb_sequence, output=False):
@@ -544,21 +608,12 @@ class ATS9360_NPT(Instrument):
                 - None.
         '''
 
-        if nb_sequence%2:
-            raise ValueError('The number of sequence should be even')
-
-        # Number of averaging
-        nb_averaging = self.buffers_per_acquisition*self.records_per_buffer\
-                       /self.nb_sequence
-
-        if nb_sequence*nb_averaging < self.default_records_per_buffer:
-            self.buffers_per_acquisition = 1
-            self.records_per_buffer      = int(nb_averaging*nb_sequence)
+        if nb_sequence<(self.default_records_per_buffer +1):
+            self.records_per_buffer         = int(nb_sequence)
+            self.nb_sequence = int(nb_sequence)
         else:
-            self.records_per_buffer      = int(self.default_records_per_buffer)
-            self.buffers_per_acquisition = int(nb_averaging*nb_sequence/self.records_per_buffer)
-
-        self.nb_sequence = nb_sequence
+            self.records_per_buffer         = self.default_records_per_buffer
+            self.nb_sequence = int(nb_sequence)
 
         if output:
             m  = 'buffer per acquisition:', self.buffers_per_acquisition
@@ -568,7 +623,6 @@ class ATS9360_NPT(Instrument):
             m += 'tot:', self.buffers_per_acquisition*self.records_per_buffer
 
             return m
-
 
 
     def do_get_nb_sequence(self):
@@ -793,7 +847,7 @@ class ATS9360_NPT(Instrument):
                   1.5e3, 1.8e3.
 
                   If the clock is set to be external (assumed 10MHz external
-                  clock), all samplerates greater than 300MHz and smaller than
+                  clock) or fast_external, all samplerates greater than 300MHz and smaller than
                   1800MHZ being a multiple of 1 MHz are allowed [should be
                   given in MS/s].
 
@@ -815,7 +869,7 @@ class ATS9360_NPT(Instrument):
                 self.samplerate = float(samplerate)
 
                 # To display the new value of acquisition time
-                self.set_acquisition_time(self.acquired_samples/self.samplerate*1e3)
+                self.set_acquisition_time(self.samplesPerRecord/self.samplerate*1e3)
             else:
 
                 raise ValueError('Samplerate not allowed by the board')
@@ -827,14 +881,27 @@ class ATS9360_NPT(Instrument):
                 self.samplerate = float(samplerate)
 
                 # To display the new value of acquisition time
-                self.set_acquisition_time(self.acquired_samples/self.samplerate*1e3)
+                self.set_acquisition_time(self.samplesPerRecord/self.samplerate*1e3)
             else:
 
                 raise ValueError('Samplerate not allowed by the board')
+
+        elif self.clock_source == 'fast_external':
+
+            if samplerate >= 300. and samplerate <= 1800.:
+
+                self.samplerate = float(samplerate)
+
+                # To display the new value of acquisition time
+                self.set_acquisition_time(self.samplesPerRecord/self.samplerate*1e3)
+            else:
+
+                raise ValueError('Samplerate not allowed by the board')
+
         else:
 
             raise ValueError('The clock source must be set to "internal"\
-                              or "external".')
+                              or "external" or "fast_external".')
 
 
 
@@ -857,7 +924,7 @@ class ATS9360_NPT(Instrument):
 
             Input:
                 - clock_source (string): Must be either "internal" or
-                 "external".
+                 "external" or fast_external.
 
             Output:
                 - None.
@@ -869,7 +936,7 @@ class ATS9360_NPT(Instrument):
         else:
 
             raise ValueError('clock_source argument must be "internal" or \
-                             "external"')
+                             "external" or "fast_external".')
 
 
 
@@ -890,7 +957,7 @@ class ATS9360_NPT(Instrument):
     #########################################################################
     #
     #
-    #                           The clock
+    #                           Status of the acquisition
     #
     #
     #########################################################################
@@ -910,3 +977,43 @@ class ATS9360_NPT(Instrument):
 
 
         return round(self._acquired_sequences*100./self.get_averaging(), 2)
+
+
+    #########################################################################
+    #
+    #
+    #                           Mode of the digitizer
+    #
+    #
+    #########################################################################
+
+    def do_set_mode(self, mode):
+        '''Set the working mode of the digitizer.
+
+            Input:
+                - mode (string): Must be "CHANNEL_AB" or
+                                 "CHANNEL_A" or "CHANNEL_B" or "FFT"
+
+            Output:
+                - None.
+        '''
+        if mode in self.allow_modes:
+
+            self.mode = mode
+        else:
+
+            raise ValueError('mode of the digitizer must be "CHANNEL_AB" or \
+                             "CHANNEL_A" or "CHANNEL_B" or "FFT"')
+
+
+    def do_get_mode(self):
+        '''Get the working mode of the digitizer
+
+            Input:
+                -
+
+            Output:
+                - mode (string)
+        '''
+
+        return self.mode

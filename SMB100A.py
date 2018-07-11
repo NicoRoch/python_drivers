@@ -282,6 +282,50 @@ class SMB100A(Instrument):
 #
 #########################################################
 
+    def set_list(self, name):
+        '''
+    	An empty list with the name of the selected list is created.
+
+
+        Input:
+            status (string): Name of the "list"
+        Output:
+            None
+        '''
+        logging.debug(__name__ + ' : creates the list  %s' % name)
+
+        self._visainstrument.write('SOUR:LIST:SEL %s'% name)
+
+    def write_list_frequency(self, parameters):
+        '''
+    	Fills the selected list with values
+
+
+        Input:
+            status (string): Elements of the list in MHz
+        Output:
+            None
+        '''
+        logging.debug(__name__ + ' : fills the selected list with values  ')
+
+        self._visainstrument.write('SOUR:LIST:FREQ %s'% name)
+
+    def set_gui_update(self, update='ON'):
+        '''
+    	The command switches the update of the display on/off.
+        A switchover from remote control to manual control always sets
+        the status of the update of the display to ON.
+
+        Input:
+            status (string): 'on' or 'off'
+        Output:
+            None
+        '''
+        logging.debug(__name__ + ' : switches the update of the display to  %s' % update)
+
+        self._visainstrument.write('SYST:DISP:UPD %s' % update)
+
+
     def do_set_freqsweep(self, freqsweep='off'):
         '''
     	Set the frequency sweep mode to 'on' or 'off'
@@ -342,7 +386,7 @@ class SMB100A(Instrument):
     	Set the frequency sweep mode
 
         Input:
-            sweepmode (string): AUTO or SINGLE
+            sweepmode (string): AUTO or SINGLE or STEP
         Output:
             None
         '''
@@ -353,8 +397,12 @@ class SMB100A(Instrument):
         elif sweepmode.upper() in ('SINGLE'):
             self._visainstrument.write('SWE:MODE AUTO')
             self._visainstrument.write('TRIG:FSW:SOUR SING')
+        elif sweepmode.upper() in ('STEP'):
+            self._visainstrument.write('SWE:MODE STEP')
+            #self._visainstrument.write('LIST:MODE STEP')
+            self._visainstrument.write('TRIG:FSW:SOUR EXT')
         else:
-            raise ValueError('set_sweepmode(): can only set AUTO or SINGLE')
+            raise ValueError('set_sweepmode(): can only set AUTO or SINGLE or STEP')
 
     def set_spacingfreq(self, spacingfreq='linear'):
         '''
@@ -433,9 +481,6 @@ class SMB100A(Instrument):
         logging.debug(__name__ + ' : Step frequency is set to %s' % stepfreq)
         self._visainstrument.write('SWE:STEP '+str(float(stepfreq))+'GHz')
 
-
-
-
     def set_pointsfreq(self,pointsfreq):
         '''
         Define the number of points of the frequency sweep in linear spacing mode.
@@ -448,6 +493,52 @@ class SMB100A(Instrument):
         '''
         logging.debug(__name__ + ' : Number of points for the frequency sweep is set to %s' % pointsfreq)
         self._visainstrument.write('SWE:POIN '+str(int(pointsfreq)))
+
+
+    def get_startfreq(self):
+        '''
+    	Get the start frequency of the sweep.
+
+        Input:
+            None
+        Output:
+            startfreq (float): first frequency of the sweep
+        '''
+        self._visainstrument.query('FREQ:START ?')
+
+    def get_stopfreq(self):
+        '''
+    	Get the stop frequency of the sweep.
+
+        Input:
+            None
+        Output:
+            stopfreq (float): last frequency of the sweep
+        '''
+        self._visainstrument.write('FREQ:STOP ?')
+
+    def get_stepfreq(self):
+        '''
+    	Get the step frequency of the sweep in linear spacing mode.
+
+        Input:
+            None
+        Output:
+            stepfreq (float): step frequency of the sweep in GHz
+        '''
+        self._visainstrument.write('SWE:STEP ?')
+
+    def get_pointsfreq(self):
+        '''
+        Get the number of points of the frequency sweep in linear spacing mode.
+        The step is changed accordingly in order to keep the start frequency and the stop frequency constant
+
+        Input:
+            None
+        Output:
+            pointsfreq (integer): number of points of the sweep
+        '''
+        self._visainstrument.write('SWE:POIN ?')
 
 #########################################################
 #
